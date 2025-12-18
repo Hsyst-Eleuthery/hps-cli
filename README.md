@@ -1,6 +1,6 @@
 # HPS CLI — HPS Browser em modo totalmente automatizável
 
-Bem-vindo(a) ao **HPS CLI**, a versão **100% linha de comando** do HPS Browser 🌐⚙️
+Bem-vindo(a) ao **HPS CLI**, a versão **100% linha de comando** do [HPS Browser](https://github.com/Hsyst/hps) 🌐⚙️
 
 Este projeto nasce da necessidade de usar a **rede descentralizada HPS** sem interface gráfica para realizar automatizações, permitindo **automação completa**, integração com scripts, servidores, pipelines, bots e qualquer outro sistema que precise interagir com a rede HPS de forma direta, confiável e silenciosa.
 
