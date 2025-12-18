@@ -138,7 +138,7 @@ Tudo o que o HPS Browser faz, o CLI **também faz**, apenas trocando cliques por
 
 ## 📚 Próximo passo
 
-👉 Leia a [Documentação Técnica](#) para entender:
+👉 Leia a [Documentação Técnica](https://github.com/Hsyst/hps-cli/blob/main/doc-tecnica.md) para entender:
 
 * Como funciona o controller_pipe
 * Como enviar comandos
