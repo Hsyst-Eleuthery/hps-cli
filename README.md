@@ -38,7 +38,7 @@ Na prática, ele é ideal para:
 
 O HPS CLI é distribuído oficialmente via **releases**:
 
-👉 [https://github.com/Hsyst/hps-cli/releases](https://github.com/Hsyst/hps-cli/releases)
+👉 [https://github.com/Hsyst-Eleuthery/hps-cli/releases](https://github.com/Hsyst-Eleuthery/hps-cli/releases)
 
 Você pode baixar:
 
@@ -116,7 +116,7 @@ O funcionamento é simples e elegante:
 3️⃣ Ele executa internamente
 4️⃣ Retorna o resultado via **arquivo de log**
 
-Esse sistema é explicado em detalhes na **Documentação Técnica**. Para saber mais [Clique aqui!](https://github.com/Hsyst/hps-cli/blob/main/doc-tecnica.md#3-controller-pipe-controllerfilemonitor)
+Esse sistema é explicado em detalhes na **Documentação Técnica**. Para saber mais [Clique aqui!](https://github.com/Hsyst-Eleuthery/hps-cli/blob/main/doc-tecnica.md#3-controller-pipe-controllerfilemonitor)
 
 ---
 
