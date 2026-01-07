@@ -136,7 +136,7 @@ Login failed: invalid credentials
 
 ## Observação
 
-Além disso, caso deseje um script exemplo de como usar, [Clique aqui.](https://github.com/Hsyst/hps-cli/blob/v1.0.0/script.sh)
+Além disso, caso deseje um script exemplo de como usar, [Clique aqui.](https://github.com/Hsyst-Eleuthery/hps-cli/blob/v1.0.0/script.sh)
 
 ---
 
