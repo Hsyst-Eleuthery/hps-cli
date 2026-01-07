@@ -1,6 +1,6 @@
 # HPS CLI — HPS Browser em modo totalmente automatizável
 
-Bem-vindo(a) ao **HPS CLI**, a versão **100% linha de comando** do [HPS Browser](https://github.com/Hsyst/hps) 🌐⚙️
+Bem-vindo(a) ao **HPS CLI**, a versão **100% linha de comando** do [HPS Browser](https://github.com/Hsyst-Eleuthery/hps) 🌐⚙️
 
 Este projeto nasce da necessidade de usar a **rede descentralizada HPS** sem interface gráfica para realizar automatizações, permitindo **automação completa**, integração com scripts, servidores, pipelines, bots e qualquer outro sistema que precise interagir com a rede HPS de forma direta, confiável e silenciosa.
 
@@ -10,7 +10,7 @@ Se o HPS Browser é a porta visual da rede, o **HPS CLI é o motor invisível po
 
 # Documentação técnica
 
-Espera, você é desenvolvedor(a) e deseja entender mais a fundo como essa aplicação funciona? [Clique aqui!](https://github.com/Hsyst/hps-cli/blob/main/doc-tecnica.md)
+Espera, você é desenvolvedor(a) e deseja entender mais a fundo como essa aplicação funciona? [Clique aqui!](https://github.com/Hsyst-Eleuthery/hps-cli/blob/main/doc-tecnica.md)
 
 ## 🧠 O que é o HPS CLI?
 
@@ -138,7 +138,7 @@ Tudo o que o HPS Browser faz, o CLI **também faz**, apenas trocando cliques por
 
 ## 📚 Próximo passo
 
-👉 Leia a [Documentação Técnica](https://github.com/Hsyst/hps-cli/blob/main/doc-tecnica.md) para entender:
+👉 Leia a [Documentação Técnica](https://github.com/Hsyst-Eleuthery/hps-cli/blob/main/doc-tecnica.md) para entender:
 
 * Como funciona o controller_pipe
 * Como enviar comandos
