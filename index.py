@@ -1,4 +1,3 @@
-# hps_cli.py - SISTEMA DE COMUNICAÇÃO ENTRE INSTÂNCIAS CLI OTIMIZADO E CONECTADO
 import asyncio
 import aiohttp
 import socketio
@@ -420,6 +419,12 @@ class CLIDisplay:
         else:
             print(f"{self.colors['yellow']}┃ ! {text}{self.colors['reset']}")
 
+    def print_alert(self, text):
+        if self.no_cli:
+            print(f"[ALERT] {text}")
+        else:
+            print(f"{self.colors['red']}{self.colors['blink']}┃ ⚠ {text}{self.colors['reset']}")
+
     def print_info(self, text):
         if self.no_cli:
             print(f"[i] {text}")
@@ -719,6 +724,22 @@ class HPSClientCore:
         self.backup_server = None
         self.auto_reconnect = True
         self.via_controller = False
+        self.active_contract_violations = {}
+        self.pending_transfers = []
+        self.pending_transfers_by_contract = {}
+        self.pending_transfer_accept_id = None
+        self.pending_contract_reissue = None
+        self.contract_certify_callback = None
+        self.contract_transfer_callback = None
+        self.contract_reset_callback = None
+        self.missing_contract_certify_callback = None
+        self.usage_contract_callback = None
+        self.pending_usage_contract = None
+        self.pending_contract_analyzer_id = None
+        self.contract_alert_message = ""
+        self.last_pending_transfer_notice = 0.0
+        self.last_contract_alert_time = 0.0
+        self.last_contract_alert_key = None
 
         self.stats_data = {
             'session_start': 0,
@@ -771,6 +792,12 @@ class HPSClientCore:
         self.search_result = None
         self.network_event = threading.Event()
         self.network_result = None
+        self.contracts_event = threading.Event()
+        self.contracts_result = None
+        self.contract_event = threading.Event()
+        self.contract_result = None
+        self.pending_transfers_event = threading.Event()
+        self.pending_transfers_result = None
 
     def init_database(self):
         with sqlite3.connect(self.db_path, timeout=30) as conn:
@@ -841,6 +868,20 @@ timestamp REAL NOT NULL
             ''')
 
             cursor.execute('''
+CREATE TABLE IF NOT EXISTS cli_contracts_cache (
+contract_id TEXT PRIMARY KEY,
+action_type TEXT NOT NULL,
+content_hash TEXT,
+domain TEXT,
+username TEXT NOT NULL,
+signature TEXT,
+timestamp REAL NOT NULL,
+verified INTEGER DEFAULT 0,
+contract_content TEXT
+)
+            ''')
+
+            cursor.execute('''
 CREATE TABLE IF NOT EXISTS cli_settings (
 key TEXT PRIMARY KEY,
 value TEXT NOT NULL
@@ -884,6 +925,13 @@ stat_value INTEGER NOT NULL,
 updated REAL NOT NULL
 )
             ''')
+
+            cursor.execute('PRAGMA table_info(cli_ddns_cache)')
+            ddns_columns = {row[1] for row in cursor.fetchall()}
+            if 'signature' not in ddns_columns:
+                cursor.execute("ALTER TABLE cli_ddns_cache ADD COLUMN signature TEXT DEFAULT ''")
+            if 'public_key' not in ddns_columns:
+                cursor.execute("ALTER TABLE cli_ddns_cache ADD COLUMN public_key TEXT DEFAULT ''")
 
             conn.commit()
 
@@ -966,6 +1014,40 @@ updated REAL NOT NULL
     def setup_cryptography(self):
         private_key_path = os.path.join(self.crypto_dir, "private_key.pem")
         public_key_path = os.path.join(self.crypto_dir, "public_key.pem")
+        browser_dir = os.path.join(os.path.expanduser("~"), ".hps_browser")
+        browser_private_path = os.path.join(browser_dir, "private_key.pem")
+        browser_public_path = os.path.join(browser_dir, "public_key.pem")
+
+        if os.path.exists(browser_private_path) and os.path.exists(browser_public_path):
+            try:
+                with open(browser_private_path, "rb") as f:
+                    browser_private = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+                with open(browser_public_path, "rb") as f:
+                    browser_public = f.read()
+                use_browser_keys = True
+                if os.path.exists(public_key_path):
+                    try:
+                        with open(public_key_path, "rb") as f:
+                            cli_public = f.read()
+                        use_browser_keys = (cli_public != browser_public)
+                    except Exception:
+                        use_browser_keys = True
+                if use_browser_keys:
+                    if os.path.exists(private_key_path):
+                        try:
+                            shutil.copy2(private_key_path, private_key_path + ".bak")
+                            shutil.copy2(public_key_path, public_key_path + ".bak")
+                        except Exception:
+                            pass
+                    self.private_key = browser_private
+                    self.public_key_pem = browser_public
+                    self.save_keys()
+                    if not self.no_cli:
+                        self.display.print_info("Using shared keys from HPS Browser.")
+                    return
+            except Exception as e:
+                if not self.no_cli:
+                    self.display.print_warning(f"Failed to load HPS Browser keys: {e}")
 
         if os.path.exists(private_key_path) and os.path.exists(public_key_path):
             try:
@@ -1026,11 +1108,14 @@ updated REAL NOT NULL
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
 
-            self.sio = socketio.AsyncClient(ssl_verify=ssl_context if ssl_context else False,
-                                          reconnection=True,
-                                          reconnection_attempts=5,
-                                          reconnection_delay=1,
-                                          reconnection_delay_max=5)
+            self.sio = socketio.AsyncClient(
+                ssl_verify=ssl_context if ssl_context else False,
+                reconnection=True,
+                reconnection_attempts=5,
+                reconnection_delay=1,
+                reconnection_delay_max=5,
+                request_timeout=120
+            )
             self.setup_socket_handlers()
 
             self.connection_ready.set()
@@ -1106,7 +1191,7 @@ updated REAL NOT NULL
             if success:
                 self.display.print_info("Server authenticated successfully")
                 if hasattr(self, 'pending_login'):
-                    await self.request_pow_challenge("login")
+                    await self.request_usage_contract()
             else:
                 error = data.get('error', 'Unknown error')
                 self.display.print_error(f"Server authentication failed: {error}")
@@ -1151,8 +1236,55 @@ updated REAL NOT NULL
                 elif action_type == "report":
                     if hasattr(self, 'pending_report'):
                         await self._report_content(*self.pending_report, nonce, hashrate)
+                elif action_type == "usage_contract":
+                    if self.usage_contract_callback:
+                        self.usage_contract_callback(nonce, hashrate)
+                        self.usage_contract_callback = None
+                elif action_type == "contract_certify":
+                    if self.contract_certify_callback:
+                        self.contract_certify_callback(nonce, hashrate)
+                        self.contract_certify_callback = None
+                    elif self.missing_contract_certify_callback:
+                        self.missing_contract_certify_callback(nonce, hashrate)
+                        self.missing_contract_certify_callback = None
+                elif action_type == "contract_transfer":
+                    if self.contract_transfer_callback:
+                        self.contract_transfer_callback(nonce, hashrate)
+                        self.contract_transfer_callback = None
+                elif action_type == "contract_reset":
+                    if self.contract_reset_callback:
+                        self.contract_reset_callback(nonce, hashrate)
+                        self.contract_reset_callback = None
             else:
                 self.display.print_error("PoW solution failed")
+
+        @self.sio.event
+        async def usage_contract_required(data):
+            threading.Thread(
+                target=self.start_usage_contract_flow,
+                args=(data,),
+                daemon=True
+            ).start()
+
+        @self.sio.event
+        async def usage_contract_status(data):
+            success = data.get('success', False)
+            if not success:
+                error = data.get('error', 'Unknown error')
+                self.display.print_error(f"Usage contract error: {error}")
+                return
+            if not data.get('required', False):
+                await self.request_pow_challenge("login")
+
+        @self.sio.event
+        async def usage_contract_ack(data):
+            success = data.get('success', False)
+            if success:
+                self.display.print_info("Usage contract accepted. Starting login PoW...")
+                await self.request_pow_challenge("login")
+            else:
+                error = data.get('error', 'Unknown error')
+                self.display.print_error(f"Usage contract rejected: {error}")
 
         @self.sio.event
         async def authentication_result(data):
@@ -1180,6 +1312,9 @@ updated REAL NOT NULL
 
                 await self.join_network()
                 await self.sync_client_files()
+                await self.sync_client_dns_files()
+                await self.sync_client_contracts()
+                await self.request_pending_transfers()
                 self.save_session_state()
                 if hasattr(self, 'pending_login'):
                     del self.pending_login
@@ -1198,6 +1333,11 @@ updated REAL NOT NULL
         async def content_response(data):
             if 'error' in data:
                 error = data['error']
+                if error == 'contract_violation':
+                    self.handle_contract_violation_response("content", data)
+                    self.content_result = data
+                    self.content_event.set()
+                    return
                 if self.via_controller:
                     print(f"Content error: {error}")
                 else:
@@ -1215,6 +1355,7 @@ updated REAL NOT NULL
             public_key = data.get('public_key', '')
             verified = data.get('verified', False)
             content_hash = data.get('content_hash', '')
+            contracts = data.get('contracts', []) or []
 
             try:
                 content = base64.b64decode(content_b64)
@@ -1250,7 +1391,13 @@ updated REAL NOT NULL
                     'content_hash': content_hash,
                     'reputation': data.get('reputation', 100),
                     'integrity_ok': integrity_ok,
+                    'contracts': contracts,
+                    'original_owner': data.get('original_owner', username),
+                    'certifier': data.get('certifier', '')
                 }
+
+                if contracts:
+                    self.store_contracts(contracts)
 
                 self.content_result = content_info
                 self.content_event.set()
@@ -1320,6 +1467,8 @@ updated REAL NOT NULL
                 content_hash = data.get('content_hash')
                 username = data.get('username')
                 verified = data.get('verified', False)
+                contracts = data.get('contracts', []) or []
+                certifier = data.get('certifier', '')
 
                 if self.via_controller:
                     print(content_hash)
@@ -1327,6 +1476,8 @@ updated REAL NOT NULL
                     self.display.print_success(f"DNS resolved: {domain} -> {content_hash}")
                     self.display.print_info(f"Owner: {username}")
                     self.display.print_info(f"Verified: {'Yes' if verified else 'No'}")
+                    if certifier:
+                        self.display.print_info(f"Certifier: {certifier}")
 
                 with sqlite3.connect(self.db_path, timeout=10) as conn:
                     cursor = conn.cursor()
@@ -1337,10 +1488,18 @@ VALUES (?, ?, ?, ?, ?, ?)
                         ''', (domain, content_hash, username, verified, time.time(), ""))
                     conn.commit()
 
+                if contracts:
+                    self.store_contracts(contracts)
+
                 self.dns_result = data
                 self.dns_event.set()
             else:
                 error = data.get('error', 'Unknown error')
+                if error == 'contract_violation':
+                    self.handle_contract_violation_response("domain", data)
+                    self.dns_result = data
+                    self.dns_event.set()
+                    return
                 if self.via_controller:
                     print(f"DNS resolution failed: {error}")
                 else:
@@ -1400,6 +1559,255 @@ VALUES (?, ?, ?, ?, ?, ?)
             if hasattr(self, 'pending_report'):
                 del self.pending_report
 
+        @self.sio.event
+        async def contracts_results(data):
+            if 'error' in data:
+                self.contracts_result = {'error': data.get('error')}
+                self.contracts_event.set()
+                return
+            contracts = data.get('contracts', []) or []
+            if contracts:
+                self.store_contracts(contracts)
+            self.contracts_result = contracts
+            self.contracts_event.set()
+
+        @self.sio.event
+        async def contract_details(data):
+            if 'error' in data:
+                self.contract_result = {'error': data.get('error')}
+                self.contract_event.set()
+                return
+            contract_info = data.get('contract')
+            if contract_info:
+                self.save_contract_to_storage(contract_info)
+            self.contract_result = contract_info
+            self.contract_event.set()
+            if self.pending_contract_analyzer_id and contract_info:
+                self.pending_contract_analyzer_id = None
+                threading.Thread(
+                    target=self.show_contract_analyzer,
+                    args=(contract_info,),
+                    daemon=True
+                ).start()
+
+        @self.sio.event
+        async def contract_violation_notice(data):
+            self.handle_contract_violation_notice(data)
+
+        @self.sio.event
+        async def contract_violation_cleared(data):
+            content_hash = data.get('content_hash')
+            domain = data.get('domain')
+            if domain:
+                self.active_contract_violations.pop(("domain", domain), None)
+            elif content_hash:
+                self.active_contract_violations.pop(("content", content_hash), None)
+            if not self.active_contract_violations and not self.pending_transfers:
+                self.clear_contract_alert()
+
+        @self.sio.event
+        async def pending_transfers(data):
+            if 'error' in data:
+                return
+            transfers = data.get('transfers', []) or []
+            self.pending_transfers = transfers
+            self.pending_transfers_by_contract = {t.get('contract_id'): t for t in transfers if t.get('contract_id')}
+            self.pending_transfers_result = transfers
+            self.pending_transfers_event.set()
+            if transfers:
+                self.show_contract_alert("Você está com pendências contratuais. Use 'contracts pending'.")
+                now = time.time()
+                if now - self.last_pending_transfer_notice > 10:
+                    self.last_pending_transfer_notice = now
+                    self.display.print_warning(
+                        f"Você tem {len(transfers)} pendência(s) contratual(is)."
+                    )
+            else:
+                if not self.active_contract_violations:
+                    self.clear_contract_alert()
+
+        @self.sio.event
+        async def pending_transfer_notice(data):
+            count = data.get('count', 1)
+            if count > 0:
+                self.show_contract_alert("Você está com pendências contratuais. Use 'contracts pending'.")
+                now = time.time()
+                if now - self.last_pending_transfer_notice > 10:
+                    self.last_pending_transfer_notice = now
+                    self.display.print_warning(
+                        f"Você tem {count} pendência(s) contratual(is)."
+                    )
+
+        @self.sio.event
+        async def transfer_payload(data):
+            if 'error' in data:
+                self.display.print_error(f"Falha ao obter transferencia: {data.get('error')}")
+                return
+            content_b64 = data.get('content_b64')
+            if not content_b64:
+                self.display.print_error("Arquivo de transferencia nao encontrado.")
+                return
+            try:
+                content = base64.b64decode(content_b64)
+            except Exception:
+                self.display.print_error("Arquivo de transferencia invalido.")
+                return
+            title = data.get('title', '')
+            description = data.get('description', '')
+            mime_type = data.get('mime_type', 'application/octet-stream')
+            threading.Thread(
+                target=self.upload_content_bytes,
+                args=(title, description, mime_type, content),
+                daemon=True
+            ).start()
+
+        @self.sio.event
+        async def reject_transfer_ack(data):
+            success = data.get('success', False)
+            if not success:
+                error = data.get('error', 'Erro desconhecido')
+                self.display.print_error(f"Falha ao rejeitar transferencia: {error}")
+                return
+            self.display.print_success("Transferencia rejeitada.")
+            await self.request_pending_transfers()
+
+        @self.sio.event
+        async def renounce_transfer_ack(data):
+            success = data.get('success', False)
+            if not success:
+                error = data.get('error', 'Erro desconhecido')
+                self.display.print_error(f"Falha ao renunciar transferencia: {error}")
+                return
+            self.display.print_success("Transferencia renunciada.")
+            await self.request_pending_transfers()
+
+        @self.sio.event
+        async def invalidate_contract_ack(data):
+            success = data.get('success', False)
+            if not success:
+                error = data.get('error', 'Erro desconhecido')
+                self.display.print_error(f"Falha ao invalidar contrato: {error}")
+                return
+            self.clear_contract_alert()
+            self.handle_contract_reissue_success(data)
+
+        @self.sio.event
+        async def certify_contract_ack(data):
+            success = data.get('success', False)
+            if not success:
+                error = data.get('error', 'Erro desconhecido')
+                self.display.print_error(f"Falha ao certificar contrato: {error}")
+                return
+            self.clear_contract_alert()
+            self.display.print_success("Contrato certificado com sucesso.")
+
+        @self.sio.event
+        async def certify_missing_contract_ack(data):
+            success = data.get('success', False)
+            if not success:
+                error = data.get('error', 'Erro desconhecido')
+                self.display.print_error(f"Falha ao certificar contrato: {error}")
+                return
+            self.clear_contract_alert()
+            self.display.print_success("Contrato certificado com sucesso.")
+
+        @self.sio.event
+        async def sync_client_dns_files(data):
+            try:
+                dns_files = data.get('dns_files', [])
+                await self.process_client_dns_files_sync(dns_files)
+            except Exception as e:
+                self.display.print_error(f"Erro ao sincronizar DNS do cliente: {e}")
+
+        @self.sio.event
+        async def client_dns_files_response(data):
+            try:
+                missing_dns = data.get('missing_dns', [])
+                await self.share_missing_dns_files(missing_dns)
+            except Exception as e:
+                self.display.print_error(f"Erro ao compartilhar DNS: {e}")
+
+        @self.sio.event
+        async def sync_client_contracts(data):
+            try:
+                contracts = data.get('contracts', [])
+                await self.process_client_contracts_sync(contracts)
+            except Exception as e:
+                self.display.print_error(f"Erro ao sincronizar contratos do cliente: {e}")
+
+        @self.sio.event
+        async def client_contracts_response(data):
+            try:
+                missing_contracts = data.get('missing_contracts', [])
+                await self.share_missing_contracts(missing_contracts)
+            except Exception as e:
+                self.display.print_error(f"Erro ao compartilhar contratos: {e}")
+
+        @self.sio.event
+        async def request_ddns_from_client(data):
+            try:
+                domain = data.get('domain')
+                if not domain:
+                    return
+                await self.send_ddns_to_server(domain)
+            except Exception as e:
+                self.display.print_error(f"Erro ao compartilhar DNS: {e}")
+
+        @self.sio.event
+        async def request_contract_from_client(data):
+            try:
+                contract_id = data.get('contract_id')
+                if not contract_id:
+                    return
+                await self.send_contract_to_server(contract_id)
+            except Exception as e:
+                self.display.print_error(f"Erro ao compartilhar contrato: {e}")
+
+        @self.sio.event
+        async def ddns_from_client(data):
+            try:
+                domain = data.get('domain')
+                ddns_content_b64 = data.get('ddns_content')
+                content_hash = data.get('content_hash')
+                username = data.get('username')
+                signature = data.get('signature', '')
+                public_key = data.get('public_key', '')
+                verified = data.get('verified', False)
+                if not all([domain, ddns_content_b64, content_hash, username]):
+                    return
+                ddns_content = base64.b64decode(ddns_content_b64)
+                self.save_ddns_to_storage(domain, ddns_content, {
+                    'content_hash': content_hash,
+                    'username': username,
+                    'verified': verified,
+                    'signature': signature,
+                    'public_key': public_key
+                })
+            except Exception as e:
+                self.display.print_error(f"Erro ao processar DNS da rede: {e}")
+
+        @self.sio.event
+        async def contract_from_client(data):
+            try:
+                contract_id = data.get('contract_id')
+                contract_content_b64 = data.get('contract_content')
+                if not contract_id or not contract_content_b64:
+                    return
+                contract_info = {
+                    'contract_id': contract_id,
+                    'action_type': data.get('action_type', ''),
+                    'content_hash': data.get('content_hash'),
+                    'domain': data.get('domain'),
+                    'username': data.get('username', ''),
+                    'signature': data.get('signature', ''),
+                    'verified': data.get('verified', False),
+                    'timestamp': time.time(),
+                    'contract_content': base64.b64decode(contract_content_b64).decode('utf-8', errors='replace')
+                }
+                self.save_contract_to_storage(contract_info)
+            except Exception as e:
+                self.display.print_error(f"Erro ao processar contrato da rede: {e}")
+
     def start_reconnect_thread(self):
         if self.reconnect_thread and self.reconnect_thread.is_alive():
             return
@@ -1432,6 +1840,20 @@ VALUES (?, ?, ?, ?, ?, ?)
             'client_identifier': self.client_identifier,
             'action_type': action_type
         })
+
+    async def request_usage_contract(self):
+        if not self.connected:
+            return
+        if not self.username:
+            return
+        await self.sio.emit('request_usage_contract', {
+            'username': self.username
+        })
+
+    async def request_pending_transfers(self):
+        if not self.connected:
+            return
+        await self.sio.emit('get_pending_transfers', {})
 
     async def send_authentication(self, pow_nonce, hashrate_observed):
         if not self.connected:
@@ -1496,6 +1918,38 @@ VALUES (?, ?, ?, ?, ?, ?)
             'files': files
         })
 
+    async def sync_client_dns_files(self):
+        if not self.connected or not self.current_user:
+            return
+        dns_files = []
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT domain, ddns_hash FROM cli_ddns_cache')
+            for row in cursor.fetchall():
+                dns_files.append({'domain': row[0], 'ddns_hash': row[1]})
+        await self.sio.emit('sync_client_dns_files', {
+            'dns_files': dns_files
+        })
+        await self.process_client_dns_files_sync(dns_files)
+
+    async def sync_client_contracts(self):
+        if not self.connected or not self.current_user:
+            return
+        contracts = []
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT contract_id, content_hash, domain FROM cli_contracts_cache')
+            for row in cursor.fetchall():
+                contracts.append({
+                    'contract_id': row[0],
+                    'content_hash': row[1],
+                    'domain': row[2]
+                })
+        await self.sio.emit('sync_client_contracts', {
+            'contracts': contracts
+        })
+        await self.process_client_contracts_sync(contracts)
+
     def handle_ban(self, duration, reason):
         self.banned_until = time.time() + duration
         self.ban_duration = duration
@@ -1537,6 +1991,201 @@ VALUES (?, ?, ?, ?, ?, ?)
             conn.commit()
 
         self.calculate_disk_usage()
+
+    def save_ddns_to_storage(self, domain, ddns_content, metadata=None):
+        ddns_hash = hashlib.sha256(ddns_content).hexdigest()
+        ddns_dir = os.path.join(self.crypto_dir, "ddns")
+        os.makedirs(ddns_dir, exist_ok=True)
+        file_path = os.path.join(ddns_dir, f"{ddns_hash}.ddns")
+        with open(file_path, 'wb') as f:
+            f.write(ddns_content)
+
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            if metadata:
+                cursor.execute('''
+INSERT OR REPLACE INTO cli_ddns_cache
+(domain, ddns_hash, content_hash, username, verified, timestamp, signature, public_key)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    domain,
+                    ddns_hash,
+                    metadata.get('content_hash', ''),
+                    metadata.get('username', ''),
+                    1 if metadata.get('verified') else 0,
+                    time.time(),
+                    metadata.get('signature', ''),
+                    metadata.get('public_key', '')
+                ))
+            conn.commit()
+
+        return ddns_hash
+
+    def get_ddns_record(self, domain):
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''SELECT ddns_hash, content_hash, username, verified, signature, public_key
+                              FROM cli_ddns_cache WHERE domain = ?''', (domain,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'ddns_hash': row[0],
+                'content_hash': row[1],
+                'username': row[2],
+                'verified': bool(row[3]),
+                'signature': row[4] or '',
+                'public_key': row[5] or ''
+            }
+
+    async def send_ddns_to_server(self, domain):
+        record = self.get_ddns_record(domain)
+        if not record:
+            return
+        ddns_file_path = os.path.join(self.crypto_dir, "ddns", f"{record['ddns_hash']}.ddns")
+        if not os.path.exists(ddns_file_path):
+            return
+        with open(ddns_file_path, 'rb') as f:
+            ddns_content = f.read()
+        await self.sio.emit('ddns_from_client', {
+            'domain': domain,
+            'ddns_content': base64.b64encode(ddns_content).decode('utf-8'),
+            'content_hash': record['content_hash'],
+            'username': record['username'],
+            'signature': record['signature'],
+            'public_key': record['public_key'],
+            'verified': record['verified']
+        })
+
+    def save_contract_to_storage(self, contract_info):
+        contract_id = contract_info.get('contract_id')
+        if not contract_id:
+            return
+        contract_content = contract_info.get('contract_content')
+        contract_text = None
+        if isinstance(contract_content, bytes):
+            contract_text = contract_content.decode('utf-8', errors='replace')
+        elif isinstance(contract_content, str):
+            contract_text = contract_content
+
+        if contract_text:
+            contracts_dir = os.path.join(self.crypto_dir, "contracts")
+            os.makedirs(contracts_dir, exist_ok=True)
+            contract_path = os.path.join(contracts_dir, f"{contract_id}.contract")
+            with open(contract_path, 'wb') as f:
+                f.write(contract_text.encode('utf-8'))
+
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            verified_value = contract_info.get('integrity_ok')
+            if verified_value is None:
+                verified_value = contract_info.get('verified')
+            cursor.execute('''
+INSERT OR REPLACE INTO cli_contracts_cache
+(contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                contract_id,
+                contract_info.get('action_type', ''),
+                contract_info.get('content_hash'),
+                contract_info.get('domain'),
+                contract_info.get('username', ''),
+                contract_info.get('signature', ''),
+                contract_info.get('timestamp', time.time()),
+                1 if verified_value else 0,
+                contract_text
+            ))
+            conn.commit()
+
+    def store_contracts(self, contracts):
+        for contract_info in contracts or []:
+            self.save_contract_to_storage(contract_info)
+
+    def get_contract_record(self, contract_id):
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''SELECT action_type, content_hash, domain, username, signature, verified, contract_content
+                              FROM cli_contracts_cache WHERE contract_id = ?''', (contract_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'action_type': row[0],
+                'content_hash': row[1],
+                'domain': row[2],
+                'username': row[3],
+                'signature': row[4] or '',
+                'verified': bool(row[5]),
+                'contract_content': row[6]
+            }
+
+    async def send_contract_to_server(self, contract_id):
+        record = self.get_contract_record(contract_id)
+        if not record:
+            return
+        contracts_dir = os.path.join(self.crypto_dir, "contracts")
+        contract_path = os.path.join(contracts_dir, f"{contract_id}.contract")
+        contract_text = record.get('contract_content')
+        if os.path.exists(contract_path):
+            with open(contract_path, 'rb') as f:
+                contract_text = f.read().decode('utf-8', errors='replace')
+        if not contract_text:
+            return
+        await self.sio.emit('contract_from_client', {
+            'contract_id': contract_id,
+            'contract_content': base64.b64encode(contract_text.encode('utf-8')).decode('utf-8'),
+            'action_type': record.get('action_type', ''),
+            'content_hash': record.get('content_hash'),
+            'domain': record.get('domain'),
+            'username': record.get('username', ''),
+            'signature': record.get('signature', ''),
+            'verified': record.get('verified', False)
+        })
+
+    def get_contract_from_cache(self, contract_id):
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''SELECT contract_id, action_type, content_hash, domain, username, signature, timestamp, verified, contract_content
+                              FROM cli_contracts_cache WHERE contract_id = ?''', (contract_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'contract_id': row[0],
+                'action_type': row[1],
+                'content_hash': row[2],
+                'domain': row[3],
+                'username': row[4],
+                'signature': row[5],
+                'timestamp': row[6],
+                'verified': bool(row[7]),
+                'integrity_ok': bool(row[7]),
+                'contract_content': row[8]
+            }
+
+    def load_cached_content(self, content_hash):
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''SELECT file_path, title, description, mime_type, username, signature, public_key, verified
+                              FROM cli_content_cache WHERE content_hash = ?''', (content_hash,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            file_path, title, description, mime_type, username, signature, public_key, verified = row
+        if not os.path.exists(file_path):
+            return None
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        return {
+            'content': content,
+            'title': title or '',
+            'description': description or '',
+            'mime_type': mime_type or 'application/octet-stream',
+            'username': username or '',
+            'signature': signature or '',
+            'public_key': public_key or '',
+            'verified': bool(verified)
+        }
 
     async def _connect_to_server(self, server_address):
         try:
@@ -1605,6 +2254,10 @@ VALUES (?, ?, ?, ?, ?, ?)
             'stats': self.handle_stats,
             'report': self.handle_report,
             'security': self.handle_security,
+            'contracts': self.handle_contracts,
+            'contract': self.handle_contracts,
+            'actions': self.handle_hps_actions,
+            'hps-actions': self.handle_hps_actions,
             'servers': self.handle_servers,
             'keys': self.handle_keys,
             'sync': self.handle_sync,
@@ -1729,14 +2382,59 @@ VALUES (?, ?, ?, ?, ?, ?)
                 self.display.print_error(f"File too large. Max size: {self.max_upload_size // (1024*1024)}MB")
                 return
 
-            header = b"# HSYST P2P SERVICE"
-            header += b"### START:"
-            header += b"# USER: " + self.current_user.encode('utf-8') + b""
-            header += b"# KEY: " + base64.b64encode(self.public_key_pem) + b""
-            header += b"### :END START"
+            file_hash = hashlib.sha256(content).hexdigest()
+            details = [
+                ("FILE_NAME", os.path.basename(file_path)),
+                ("FILE_SIZE", str(len(content))),
+                ("FILE_HASH", file_hash),
+                ("TITLE", title),
+                ("MIME", mime_type),
+                ("DESCRIPTION", description),
+                ("PUBLIC_KEY", base64.b64encode(self.public_key_pem).decode('utf-8'))
+            ]
+            app_name = self.extract_app_name(title)
+            if app_name:
+                details.append(("APP", app_name))
+            transfer_type, transfer_to, transfer_app = self.parse_transfer_title(title)
+            if title == '(HPS!dns_change){change_dns_owner=true, proceed=true}':
+                domain, new_owner = self.parse_domain_transfer_target(content)
+                if new_owner:
+                    transfer_type = "domain"
+                    transfer_to = new_owner
+                if domain:
+                    details.append(("DOMAIN", domain))
+            if transfer_to:
+                details.append(("TRANSFER_TO", transfer_to))
+            if transfer_type:
+                details.append(("TRANSFER_TYPE", transfer_type))
+            if transfer_app:
+                details.append(("APP", transfer_app))
 
-            full_content_with_header = header + content
-            content_hash = hashlib.sha256(full_content_with_header).hexdigest()
+            allowed_actions = ["upload_file"]
+            if title == '(HPS!dns_change){change_dns_owner=true, proceed=true}':
+                allowed_actions = ["transfer_domain"]
+            elif transfer_type == "file":
+                allowed_actions = ["transfer_content"]
+            elif transfer_type == "api_app":
+                allowed_actions = ["transfer_api_app"]
+            elif title.startswith('(HPS!api)'):
+                allowed_actions = ["upload_file", "change_api_app"]
+
+            contract_template = self.build_contract_template(allowed_actions[0], details)
+            if self.via_controller or self.no_cli:
+                try:
+                    contract_text = self.sign_contract_template(contract_template, allowed_actions)
+                except ValueError as e:
+                    self.display.print_error(str(e))
+                    return
+            else:
+                contract_text = self.prompt_contract_signature(contract_template, allowed_actions, "Contrato (Upload)")
+                if not contract_text:
+                    self.display.print_error("Contrato de upload não aceito")
+                    return
+
+            full_content = content + contract_text.encode('utf-8')
+            content_hash = hashlib.sha256(content).hexdigest()
 
             signature = self.private_key.sign(
                 content,
@@ -1744,7 +2442,7 @@ VALUES (?, ?, ?, ?, ?, ?)
                 hashes.SHA256()
             )
 
-            self.save_content_to_storage(content_hash, full_content_with_header, {
+            self.save_content_to_storage(content_hash, content, {
                 'title': title,
                 'description': description,
                 'mime_type': mime_type,
@@ -1754,7 +2452,7 @@ VALUES (?, ?, ?, ?, ?, ?)
                 'verified': True
             })
 
-            self.pending_upload = (content_hash, title, description, mime_type, len(full_content_with_header), signature, full_content_with_header)
+            self.pending_upload = (content_hash, title, description, mime_type, len(content), signature, full_content)
             self.upload_event.clear()
             self.upload_result = None
 
@@ -1785,12 +2483,116 @@ VALUES (?, ?, ?, ?, ?, ?)
             else:
                 self.display.print_error(f"Upload error: {e}")
 
-    async def _upload_file(self, content_hash, title, description, mime_type, size, signature, full_content_with_header, pow_nonce, hashrate_observed):
+    def upload_content_bytes(self, title, description, mime_type, content):
+        if not self.current_user:
+            self.display.print_error("You need to be logged in to upload")
+            return
+
+        if not title:
+            title = "upload.bin"
+
+        if mime_type is None:
+            mime_type, _ = mimetypes.guess_type(title)
+            if not mime_type:
+                mime_type = 'application/octet-stream'
+
+        if len(content) > self.max_upload_size:
+            self.display.print_error(f"File too large. Max size: {self.max_upload_size // (1024*1024)}MB")
+            return
+        file_hash = hashlib.sha256(content).hexdigest()
+        details = [
+            ("FILE_NAME", title),
+            ("FILE_SIZE", str(len(content))),
+            ("FILE_HASH", file_hash),
+            ("TITLE", title),
+            ("MIME", mime_type),
+            ("DESCRIPTION", description),
+            ("PUBLIC_KEY", base64.b64encode(self.public_key_pem).decode('utf-8'))
+        ]
+        app_name = self.extract_app_name(title)
+        if app_name:
+            details.append(("APP", app_name))
+        transfer_type, transfer_to, transfer_app = self.parse_transfer_title(title)
+        if title == '(HPS!dns_change){change_dns_owner=true, proceed=true}':
+            domain, new_owner = self.parse_domain_transfer_target(content)
+            if new_owner:
+                transfer_type = "domain"
+                transfer_to = new_owner
+            if domain:
+                details.append(("DOMAIN", domain))
+        if transfer_to:
+            details.append(("TRANSFER_TO", transfer_to))
+        if transfer_type:
+            details.append(("TRANSFER_TYPE", transfer_type))
+        if transfer_app:
+            details.append(("APP", transfer_app))
+
+        allowed_actions = ["upload_file"]
+        if title == '(HPS!dns_change){change_dns_owner=true, proceed=true}':
+            allowed_actions = ["transfer_domain"]
+        elif transfer_type == "file":
+            allowed_actions = ["transfer_content"]
+        elif transfer_type == "api_app":
+            allowed_actions = ["transfer_api_app"]
+        elif title.startswith('(HPS!api)'):
+            allowed_actions = ["upload_file", "change_api_app"]
+
+        contract_template = self.build_contract_template(allowed_actions[0], details)
+        if self.via_controller or self.no_cli:
+            try:
+                contract_text = self.sign_contract_template(contract_template, allowed_actions)
+            except ValueError as e:
+                self.display.print_error(str(e))
+                return
+        else:
+            contract_text = self.prompt_contract_signature(contract_template, allowed_actions, "Contrato (Upload)")
+            if not contract_text:
+                self.display.print_error("Contrato de upload não aceito")
+                return
+
+        full_content = content + contract_text.encode('utf-8')
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        signature = self.private_key.sign(
+            content,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+
+        self.save_content_to_storage(content_hash, content, {
+            'title': title,
+            'description': description,
+            'mime_type': mime_type,
+            'username': self.current_user,
+            'signature': base64.b64encode(signature).decode('utf-8'),
+            'public_key': base64.b64encode(self.public_key_pem).decode('utf-8'),
+            'verified': True
+        })
+
+        self.pending_upload = (content_hash, title, description, mime_type, len(content), signature, full_content)
+        self.upload_event.clear()
+        self.upload_result = None
+
+        self.run_async(self.request_pow_challenge("upload"))
+
+        if not self.upload_event.wait(300):
+            self.display.print_error("Upload timeout")
+            if hasattr(self, 'pending_upload'):
+                del self.pending_upload
+            return
+
+        if self.upload_result and self.upload_result.get('success'):
+            hash_value = self.upload_result.get('content_hash', '')
+            self.display.print_success(f"Upload completed successfully! Hash: {hash_value}")
+        else:
+            self.display.print_error("Upload failed")
+
+    async def _upload_file(self, content_hash, title, description, mime_type, size, signature, full_content, pow_nonce, hashrate_observed):
         if not self.connected:
             return
 
         try:
-            content_b64 = base64.b64encode(full_content_with_header).decode('utf-8')
+            content_b64 = base64.b64encode(full_content).decode('utf-8')
             data = {
                 'content_hash': content_hash,
                 'title': title,
@@ -1917,16 +2719,49 @@ VALUES (?, ?, ?, ?, ?, ?)
             self.display.print_info(f"Domain: {domain}")
             self.display.print_info(f"Hash: {content_hash}")
 
+        details = [
+            ("DOMAIN", domain),
+            ("CONTENT_HASH", content_hash),
+            ("PUBLIC_KEY", base64.b64encode(self.public_key_pem).decode('utf-8'))
+        ]
+        contract_template = self.build_contract_template("register_dns", details)
+        if self.via_controller or self.no_cli:
+            try:
+                contract_text = self.sign_contract_template(contract_template, ["register_dns"])
+            except ValueError as e:
+                self.display.print_error(str(e))
+                return
+        else:
+            contract_text = self.prompt_contract_signature(contract_template, ["register_dns"], "Contrato (DNS)")
+            if not contract_text:
+                self.display.print_error("Contrato de DNS não aceito")
+                return
+
         ddns_content = self.create_ddns_file(domain, content_hash)
         ddns_hash = hashlib.sha256(ddns_content).hexdigest()
+        ddns_content_full = ddns_content + contract_text.encode('utf-8')
+
+        header_end = b'### :END START'
+        if header_end in ddns_content:
+            _, ddns_data_signed = ddns_content.split(header_end, 1)
+        else:
+            ddns_data_signed = ddns_content
 
         signature = self.private_key.sign(
-            ddns_content,
+            ddns_data_signed,
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256()
         )
 
-        self.pending_dns = (domain, ddns_content, signature)
+        self.save_ddns_to_storage(domain, ddns_content, {
+            'content_hash': content_hash,
+            'username': self.current_user,
+            'verified': True,
+            'signature': base64.b64encode(signature).decode('utf-8'),
+            'public_key': base64.b64encode(self.public_key_pem).decode('utf-8')
+        })
+
+        self.pending_dns = (domain, ddns_content_full, signature)
         self.dns_event.clear()
         self.dns_result = None
 
@@ -1939,6 +2774,11 @@ VALUES (?, ?, ?, ?, ?, ?)
             return
 
         if self.dns_result and self.dns_result.get('success'):
+            self.display.print_success("DNS registered successfully!")
+        else:
+            self.display.print_error("DNS registration failed")
+
+        if self.dns_result and self.dns_result.get('success'):
             if self.via_controller:
                 print("DNS registered successfully")
             else:
@@ -1948,6 +2788,67 @@ VALUES (?, ?, ?, ?, ?, ?)
                 print("DNS registration failed")
             else:
                 self.display.print_error("DNS registration failed")
+
+    def register_dns_with_hash(self, domain, content_hash):
+        if not self.current_user:
+            self.display.print_error("You need to be logged in to register DNS")
+            return
+        if not self.is_valid_domain(domain):
+            self.display.print_error("Invalid domain. Use only letters, numbers and hyphens.")
+            return
+
+        details = [
+            ("DOMAIN", domain),
+            ("CONTENT_HASH", content_hash),
+            ("PUBLIC_KEY", base64.b64encode(self.public_key_pem).decode('utf-8'))
+        ]
+        contract_template = self.build_contract_template("register_dns", details)
+        if self.via_controller or self.no_cli:
+            try:
+                contract_text = self.sign_contract_template(contract_template, ["register_dns"])
+            except ValueError as e:
+                self.display.print_error(str(e))
+                return
+        else:
+            contract_text = self.prompt_contract_signature(contract_template, ["register_dns"], "Contrato (DNS)")
+            if not contract_text:
+                self.display.print_error("Contrato de DNS não aceito")
+                return
+
+        ddns_content = self.create_ddns_file(domain, content_hash)
+        ddns_content_full = ddns_content + contract_text.encode('utf-8')
+
+        header_end = b'### :END START'
+        if header_end in ddns_content:
+            _, ddns_data_signed = ddns_content.split(header_end, 1)
+        else:
+            ddns_data_signed = ddns_content
+
+        signature = self.private_key.sign(
+            ddns_data_signed,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+
+        self.save_ddns_to_storage(domain, ddns_content, {
+            'content_hash': content_hash,
+            'username': self.current_user,
+            'verified': True,
+            'signature': base64.b64encode(signature).decode('utf-8'),
+            'public_key': base64.b64encode(self.public_key_pem).decode('utf-8')
+        })
+
+        self.pending_dns = (domain, ddns_content_full, signature)
+        self.dns_event.clear()
+        self.dns_result = None
+
+        self.run_async(self.request_pow_challenge("dns"))
+
+        if not self.dns_event.wait(300):
+            self.display.print_error("DNS registration timeout")
+            if hasattr(self, 'pending_dns'):
+                del self.pending_dns
+            return
 
     async def _register_dns(self, domain, ddns_content, signature, pow_nonce, hashrate_observed):
         if not self.connected:
@@ -1969,14 +2870,629 @@ VALUES (?, ?, ?, ?, ?, ?)
     def create_ddns_file(self, domain, content_hash):
         ddns_content = f"""# HSYST P2P SERVICE
 ### START:
-            # USER: {self.current_user}
-            # KEY: {base64.b64encode(self.public_key_pem).decode('utf-8')}
+# USER: {self.current_user}
+# KEY: {base64.b64encode(self.public_key_pem).decode('utf-8')}
 ### :END START
 ### DNS:
-            # DNAME: {domain} = {content_hash}
+# DNAME: {domain} = {content_hash}
 ### :END DNS
-            """
+"""
         return ddns_content.encode('utf-8')
+
+    def build_hps_transfer_title(self, transfer_type, target_user, app_name=None):
+        if transfer_type == "api_app" and app_name:
+            return f"(HPS!transfer){{type={transfer_type}, to={target_user}, app={app_name}}}"
+        return f"(HPS!transfer){{type={transfer_type}, to={target_user}}}"
+
+    def build_hps_api_title(self, app_name):
+        return f'(HPS!api){{app}}:{{"{app_name}"}}'
+
+    def build_hps_dns_change_title(self):
+        return "(HPS!dns_change){change_dns_owner=true, proceed=true}"
+
+    def build_domain_transfer_payload(self, domain, new_owner):
+        username = self.current_user or self.username
+        lines = [
+            "# HSYST P2P SERVICE",
+            "### START:",
+            f"# USER: {username}",
+            "### :END START",
+            "### DNS:",
+            f"# NEW_DNAME: DOMAIN = {domain}",
+            f"# NEW_DOWNER: OWNER = {new_owner}",
+            "### :END DNS",
+            "### MODIFY:",
+            "# change_dns_owner = true",
+            "# proceed = true",
+            "### :END MODIFY"
+        ]
+        return "\n".join(lines).encode("utf-8")
+
+    def extract_app_name(self, title):
+        match = re.search(r'\(HPS!api\)\{app\}:\{"([^"]+)"\}', title)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def parse_transfer_title(self, title):
+        if not title:
+            return None, None, None
+        match = re.search(r'\(HPS!transfer\)\{type=([^,}]+),\s*to=([^,}]+)(?:,\s*app=([^}]+))?\}', title)
+        if match:
+            transfer_type = match.group(1).strip().lower()
+            target_user = match.group(2).strip()
+            app_name = match.group(3).strip() if match.group(3) else None
+            return transfer_type, target_user, app_name
+        return None, None, None
+
+    def parse_domain_transfer_target(self, content):
+        try:
+            content_str = content.decode('utf-8')
+        except Exception:
+            return None, None
+        domain = None
+        new_owner = None
+        in_dns_section = False
+        for line in content_str.splitlines():
+            line = line.strip()
+            if line == '### DNS:':
+                in_dns_section = True
+                continue
+            if line == '### :END DNS':
+                in_dns_section = False
+                continue
+            if in_dns_section and line.startswith('# NEW_DNAME:'):
+                tail = line.split(':', 1)[1].strip()
+                if '=' in tail:
+                    domain = tail.split('=', 1)[1].strip()
+                else:
+                    domain = tail.strip()
+            if line.startswith('# NEW_DOWNER:'):
+                tail = line.split(':', 1)[1].strip()
+                if '=' in tail:
+                    new_owner = tail.split('=', 1)[1].strip()
+                else:
+                    new_owner = tail.strip()
+        return domain, new_owner
+
+    def build_contract_template(self, action_type, details):
+        lines = [
+            "# HSYST P2P SERVICE",
+            "## CONTRACT:",
+            "### DETAILS:",
+            f"# ACTION: {action_type}"
+        ]
+        for key, value in details:
+            lines.append(f"# {key}: {value}")
+        lines.extend([
+            "### :END DETAILS",
+            "### START:",
+            f"# USER: {self.current_user}",
+            "# SIGNATURE: ",
+            "### :END START",
+            "## :END CONTRACT"
+        ])
+        return "\n".join(lines) + "\n"
+
+    def build_usage_contract_template(self, terms_text, contract_hash):
+        username = self.current_user or self.username
+        lines = [
+            "# HSYST P2P SERVICE",
+            "## CONTRACT:",
+            "### DETAILS:",
+            "# ACTION: accept_usage",
+            f"# USAGE_CONTRACT_HASH: {contract_hash}",
+            "### :END DETAILS",
+            "### TERMS:"
+        ]
+        for line in terms_text.splitlines():
+            lines.append(f"# {line}")
+        lines.extend([
+            "### :END TERMS",
+            "### START:",
+            f"# USER: {username}",
+            "# SIGNATURE: ",
+            "### :END START",
+            "## :END CONTRACT"
+        ])
+        return "\n".join(lines) + "\n"
+
+    def build_certify_contract_template(self, target_type, target_id, reason=None,
+                                        contract_id=None, original_owner=None, original_action=None):
+        details = [
+            ("TARGET_TYPE", target_type),
+            ("TARGET_ID", target_id)
+        ]
+        if reason:
+            details.append(("REASON", reason))
+        if contract_id:
+            details.append(("SOURCE_CONTRACT", contract_id))
+        if original_owner:
+            details.append(("ORIGINAL_OWNER", original_owner))
+        if original_action:
+            details.append(("ORIGINAL_ACTION", original_action))
+        return self.build_contract_template("certify_contract", details)
+
+    def parse_contract_info(self, contract_text):
+        info = {'action': None, 'user': None, 'signature': None}
+        current_section = None
+        for line in contract_text.splitlines():
+            line = line.strip()
+            if line.startswith("### "):
+                if line.endswith(":"):
+                    current_section = line[4:-1].lower()
+            elif line.startswith("### :END "):
+                current_section = None
+            elif line.startswith("# "):
+                if current_section == "details" and line.startswith("# ACTION:"):
+                    info['action'] = line.split(":", 1)[1].strip()
+                elif current_section == "start" and line.startswith("# USER:"):
+                    info['user'] = line.split(":", 1)[1].strip()
+                elif current_section == "start" and line.startswith("# SIGNATURE:"):
+                    info['signature'] = line.split(":", 1)[1].strip()
+        return info
+
+    def validate_contract_text(self, contract_text, expected_action):
+        if not contract_text.startswith("# HSYST P2P SERVICE"):
+            return False, "Cabeçalho HSYST não encontrado"
+        if "## :END CONTRACT" not in contract_text:
+            return False, "Final do contrato não encontrado"
+        info = self.parse_contract_info(contract_text)
+        if not info['action']:
+            return False, "Ação não informada no contrato"
+        if info['action'] != expected_action:
+            return False, f"Ação inválida no contrato (esperado {expected_action})"
+        if not info['user']:
+            return False, "Usuário não informado no contrato"
+        expected_user = self.current_user or self.username
+        if info['user'] != expected_user:
+            return False, "Usuário do contrato não corresponde ao usuário logado"
+        return True, ""
+
+    def validate_contract_text_allowed(self, contract_text, allowed_actions):
+        if not contract_text.startswith("# HSYST P2P SERVICE"):
+            return False, "Cabeçalho HSYST não encontrado"
+        if "## :END CONTRACT" not in contract_text:
+            return False, "Final do contrato não encontrado"
+        info = self.parse_contract_info(contract_text)
+        if not info['action']:
+            return False, "Ação não informada no contrato"
+        if info['action'] not in allowed_actions:
+            return False, f"Ação inválida no contrato (permitido: {', '.join(allowed_actions)})"
+        if not info['user']:
+            return False, "Usuário não informado no contrato"
+        expected_user = self.current_user or self.username
+        if info['user'] != expected_user:
+            return False, "Usuário do contrato não corresponde ao usuário logado"
+        return True, ""
+
+    def apply_contract_signature(self, contract_text):
+        lines = contract_text.splitlines()
+        signature_index = None
+        signed_lines = []
+        for idx, line in enumerate(lines):
+            if line.strip().startswith("# SIGNATURE:"):
+                signature_index = idx
+                continue
+            signed_lines.append(line)
+        if signature_index is None:
+            raise ValueError("Linha de assinatura não encontrada no contrato")
+        signed_text = "\n".join(signed_lines)
+        signature = self.private_key.sign(
+            signed_text.encode('utf-8'),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+        signature_b64 = base64.b64encode(signature).decode('utf-8')
+        lines[signature_index] = f"# SIGNATURE: {signature_b64}"
+        return "\n".join(lines).strip() + "\n", signature_b64
+
+    def extract_contract_details_lines(self, contract_text):
+        if not contract_text:
+            return []
+        details_lines = []
+        in_details = False
+        for line in contract_text.splitlines():
+            line = line.strip()
+            if line == "### DETAILS:":
+                in_details = True
+                continue
+            if line == "### :END DETAILS":
+                break
+            if in_details and line.startswith("# "):
+                details_lines.append(line[2:])
+        return details_lines
+
+    def build_contract_summary(self, contract_info, contract_text):
+        contract_hash = hashlib.sha256(contract_text.encode('utf-8')).hexdigest() if contract_text else ""
+        verified_text = "Sim" if contract_info.get('verified') else "Não"
+        integrity_ok = contract_info.get('integrity_ok')
+        if integrity_ok is None:
+            integrity_ok = contract_info.get('verified', False)
+        integrity_text = "OK" if integrity_ok else "ADULTERADO"
+        timestamp = contract_info.get('timestamp')
+        timestamp_str = ""
+        if timestamp:
+            try:
+                timestamp_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                timestamp_str = str(timestamp)
+        summary = [
+            f"ID: {contract_info.get('contract_id', '')}",
+            f"Ação: {contract_info.get('action_type', '')}",
+            f"Hash do conteúdo: {contract_info.get('content_hash', '')}",
+            f"Domínio: {contract_info.get('domain', '')}",
+            f"Usuário: {contract_info.get('username', '')}",
+            f"Verificado: {verified_text}",
+            f"Integridade: {integrity_text}",
+            f"Data: {timestamp_str}",
+            f"Hash do contrato: {contract_hash}",
+            ""
+        ]
+        details_lines = self.extract_contract_details_lines(contract_text)
+        if details_lines:
+            summary.append("Detalhes:")
+            summary.extend(details_lines)
+        return summary
+
+    def show_contract_analyzer(self, contract_info, title="Analisador de Contratos"):
+        contract_text = contract_info.get('contract_content') or ""
+        summary_lines = self.build_contract_summary(contract_info, contract_text)
+        integrity_ok = contract_info.get('integrity_ok')
+        if integrity_ok is None:
+            integrity_ok = contract_info.get('verified', False)
+        contract_id = contract_info.get('contract_id')
+        owner = contract_info.get('username')
+        is_owner = bool(self.current_user and owner and self.current_user == owner)
+
+        if self.via_controller:
+            print(title)
+            for line in summary_lines:
+                print(line)
+            if contract_text:
+                print(contract_text)
+            return
+
+        self.display.print_section(title)
+        for line in summary_lines:
+            print(line)
+        if contract_text:
+            print(contract_text)
+
+        actions = []
+        if contract_id:
+            actions.append(("Atualizar detalhes", lambda: self.refresh_contract_analyzer(contract_id)))
+        pending_transfer = self.pending_transfers_by_contract.get(contract_id)
+        if pending_transfer and pending_transfer.get('target_user') == self.current_user:
+            self.display.print_warning(
+                f"{pending_transfer.get('original_owner')} quer transferir para você. "
+                "Use as ações para aceitar, rejeitar ou renunciar."
+            )
+            actions.append(("Aceitar transferência", lambda: self.start_transfer_accept(pending_transfer)))
+            actions.append(("Rejeitar transferência", lambda: self.start_transfer_reject(pending_transfer)))
+            actions.append(("Renunciar transferência", lambda: self.start_transfer_renounce(pending_transfer)))
+
+        if not integrity_ok:
+            if is_owner:
+                actions.append(("Emitir novo contrato", lambda: self.start_contract_reissue(contract_info)))
+            else:
+                actions.append(("Certificar contrato", lambda: self.start_contract_certify(contract_info)))
+        if is_owner:
+            actions.append(("Invalidar contrato", lambda: self.start_contract_invalidate(contract_info)))
+
+        if not actions:
+            return
+
+        self.display.print_section("Ações Disponíveis")
+        for idx, (label, _) in enumerate(actions, start=1):
+            self.display.print_info(f"{idx}) {label}")
+        choice = self.display.get_input("Escolha uma ação ou Enter para sair: ").strip()
+        if not choice:
+            return
+        try:
+            index = int(choice) - 1
+        except ValueError:
+            self.display.print_warning("Opção inválida.")
+            return
+        if 0 <= index < len(actions):
+            actions[index][1]()
+
+    def refresh_contract_analyzer(self, contract_id):
+        if not contract_id:
+            return
+        self.pending_contract_analyzer_id = contract_id
+        asyncio.run_coroutine_threadsafe(self.sio.emit('get_contract', {'contract_id': contract_id}), self.loop)
+
+    def prompt_contract_signature(self, contract_template, allowed_actions, title="Contrato"):
+        if self.via_controller:
+            return None
+        self.display.print_section(title)
+        print(contract_template)
+        confirm = self.display.get_input("Assinar contrato? (y/n): ").strip().lower()
+        if confirm != 'y':
+            return None
+        signed_text, _ = self.apply_contract_signature(contract_template)
+        signed_text = signed_text.strip()
+        valid, error = self.validate_contract_text_allowed(signed_text, allowed_actions)
+        if not valid:
+            self.display.print_error(error)
+            return None
+        return signed_text
+
+    def sign_contract_template(self, contract_template, allowed_actions):
+        signed_text, _ = self.apply_contract_signature(contract_template)
+        signed_text = signed_text.strip()
+        valid, error = self.validate_contract_text_allowed(signed_text, allowed_actions)
+        if not valid:
+            raise ValueError(error)
+        return signed_text
+
+    def start_usage_contract_flow(self, data):
+        terms_text = data.get('contract_text', '') or ""
+        contract_hash = data.get('contract_hash', '')
+        if not contract_hash:
+            self.display.print_error("Contrato de uso indisponível no servidor.")
+            return
+        contract_template = self.build_usage_contract_template(terms_text, contract_hash)
+        contract_text = self.prompt_contract_signature(contract_template, ["accept_usage"], "Contrato de Uso")
+        if not contract_text:
+            self.display.print_error("Contrato de uso não aceito. Login cancelado.")
+            return
+
+        def do_accept(pow_nonce, hashrate_observed):
+            asyncio.run_coroutine_threadsafe(
+                self.sio.emit('accept_usage_contract', {
+                    'contract_content': base64.b64encode(contract_text.encode('utf-8')).decode('utf-8'),
+                    'public_key': base64.b64encode(self.public_key_pem).decode('utf-8'),
+                    'client_identifier': self.client_identifier,
+                    'pow_nonce': pow_nonce,
+                    'hashrate_observed': hashrate_observed
+                }),
+                self.loop
+            )
+        self.usage_contract_callback = do_accept
+        asyncio.run_coroutine_threadsafe(self.request_pow_challenge("usage_contract"), self.loop)
+
+    def start_contract_invalidate(self, contract_info):
+        contract_id = contract_info.get('contract_id')
+        if not contract_id:
+            return
+        def do_invalidate(pow_nonce, hashrate_observed):
+            asyncio.run_coroutine_threadsafe(
+                self.sio.emit('invalidate_contract', {
+                    'contract_id': contract_id,
+                    'pow_nonce': pow_nonce,
+                    'hashrate_observed': hashrate_observed
+                }),
+                self.loop
+            )
+        self.contract_reset_callback = do_invalidate
+        asyncio.run_coroutine_threadsafe(self.request_pow_challenge("contract_reset"), self.loop)
+
+    def start_contract_reissue(self, contract_info):
+        self.pending_contract_reissue = contract_info
+        self.start_contract_invalidate(contract_info)
+
+    def handle_contract_reissue_success(self, data):
+        contract_info = self.pending_contract_reissue
+        self.pending_contract_reissue = None
+        if not contract_info:
+            self.display.print_success("Contrato invalidado com sucesso.")
+            return
+        action_type = contract_info.get('action_type')
+        content_hash = contract_info.get('content_hash')
+        domain = contract_info.get('domain')
+        if action_type == "register_dns" and domain:
+            if not content_hash:
+                content_hash = self.display.get_input("Hash do conteúdo para DNS: ").strip()
+            if not content_hash:
+                self.display.print_warning("Hash do conteúdo não informado.")
+                return
+            self.register_dns_with_hash(domain, content_hash)
+            return
+        if content_hash:
+            cached = self.load_cached_content(content_hash)
+            if not cached:
+                self.display.print_warning("Arquivo não encontrado no cache local para reenvio.")
+                return
+            self.upload_content_bytes(
+                cached['title'],
+                cached.get('description', ''),
+                cached.get('mime_type', 'application/octet-stream'),
+                cached['content']
+            )
+
+    def start_contract_certify(self, contract_info):
+        contract_id = contract_info.get('contract_id')
+        if not contract_id:
+            return
+        target_type = "domain" if contract_info.get('domain') else "content"
+        target_id = contract_info.get('domain') or contract_info.get('content_hash')
+        if not target_id:
+            self.display.print_error("Contrato sem alvo válido para certificação.")
+            return
+        contract_template = self.build_certify_contract_template(
+            target_type=target_type,
+            target_id=target_id,
+            reason="invalid_contract",
+            contract_id=contract_id,
+            original_owner=contract_info.get('username'),
+            original_action=contract_info.get('action_type')
+        )
+        contract_text = self.prompt_contract_signature(contract_template, ["certify_contract"], "Certificação de Contrato")
+        if not contract_text:
+            return
+
+        def do_certify(pow_nonce, hashrate_observed):
+            payload = {
+                'contract_content': base64.b64encode(contract_text.encode('utf-8')).decode('utf-8'),
+                'pow_nonce': pow_nonce,
+                'hashrate_observed': hashrate_observed,
+                'contract_id': contract_id
+            }
+            asyncio.run_coroutine_threadsafe(self.sio.emit('certify_contract', payload), self.loop)
+
+        self.contract_certify_callback = do_certify
+        asyncio.run_coroutine_threadsafe(self.request_pow_challenge("contract_certify"), self.loop)
+
+    def start_missing_contract_certify(self, target_type, target_id):
+        contract_template = self.build_certify_contract_template(
+            target_type=target_type,
+            target_id=target_id,
+            reason="missing_contract"
+        )
+        contract_text = self.prompt_contract_signature(
+            contract_template,
+            ["certify_contract"],
+            "Certificação de Contrato Ausente"
+        )
+        if not contract_text:
+            return
+
+        def do_certify(pow_nonce, hashrate_observed):
+            payload = {
+                'contract_content': base64.b64encode(contract_text.encode('utf-8')).decode('utf-8'),
+                'pow_nonce': pow_nonce,
+                'hashrate_observed': hashrate_observed,
+                'target_type': target_type,
+                'target_id': target_id
+            }
+            asyncio.run_coroutine_threadsafe(self.sio.emit('certify_missing_contract', payload), self.loop)
+
+        self.missing_contract_certify_callback = do_certify
+        asyncio.run_coroutine_threadsafe(self.request_pow_challenge("contract_certify"), self.loop)
+
+    def start_transfer_accept(self, pending_transfer):
+        transfer_id = pending_transfer.get('transfer_id')
+        if not transfer_id:
+            return
+        self.pending_transfer_accept_id = transfer_id
+        asyncio.run_coroutine_threadsafe(
+            self.sio.emit('get_transfer_payload', {'transfer_id': transfer_id}),
+            self.loop
+        )
+
+    def start_transfer_reject(self, pending_transfer):
+        transfer_id = pending_transfer.get('transfer_id')
+        if not transfer_id:
+            return
+        def do_reject(pow_nonce, hashrate_observed):
+            asyncio.run_coroutine_threadsafe(
+                self.sio.emit('reject_transfer', {
+                    'transfer_id': transfer_id,
+                    'pow_nonce': pow_nonce,
+                    'hashrate_observed': hashrate_observed
+                }),
+                self.loop
+            )
+        self.contract_transfer_callback = do_reject
+        asyncio.run_coroutine_threadsafe(self.request_pow_challenge("contract_transfer"), self.loop)
+
+    def start_transfer_renounce(self, pending_transfer):
+        transfer_id = pending_transfer.get('transfer_id')
+        if not transfer_id:
+            return
+        def do_renounce(pow_nonce, hashrate_observed):
+            asyncio.run_coroutine_threadsafe(
+                self.sio.emit('renounce_transfer', {
+                    'transfer_id': transfer_id,
+                    'pow_nonce': pow_nonce,
+                    'hashrate_observed': hashrate_observed
+                }),
+                self.loop
+            )
+        self.contract_transfer_callback = do_renounce
+        asyncio.run_coroutine_threadsafe(self.request_pow_challenge("contract_transfer"), self.loop)
+
+    def show_contract_alert(self, message):
+        self.contract_alert_message = message
+        self.display.print_alert(message)
+
+    def clear_contract_alert(self):
+        self.contract_alert_message = ""
+        self.last_contract_alert_key = None
+
+    def handle_contract_violation_notice(self, data):
+        violation_type = data.get('violation_type')
+        content_hash = data.get('content_hash')
+        domain = data.get('domain')
+        reason = data.get('reason', 'invalid_contract')
+        target = domain or content_hash or "desconhecido"
+        message = f"Contrato adulterado: {target}"
+        if reason == "missing_contract":
+            message = f"Contrato ausente: {target}"
+        if domain:
+            key = ("domain", domain)
+        elif content_hash:
+            key = ("content", content_hash)
+        else:
+            key = ("unknown", target)
+
+        if self.active_contract_violations.get(key) == reason:
+            now = time.time()
+            if self.last_contract_alert_key == key and now - self.last_contract_alert_time < 10:
+                return
+            self.last_contract_alert_key = key
+            self.last_contract_alert_time = now
+        self.active_contract_violations[key] = reason
+        self.show_contract_alert("Você está com pendências contratuais. Use 'contracts fix' ou 'contracts pending'.")
+        self.display.print_warning(message)
+
+    def handle_contract_violation_response(self, target_type, data):
+        reason = data.get('contract_violation_reason', 'invalid_contract')
+        target = data.get('domain') if target_type == "domain" else data.get('content_hash')
+        message = "Contrato adulterado."
+        if reason == "missing_contract":
+            message = "Contrato ausente."
+        if target:
+            message = f"{message} Alvo: {target}"
+        if target_type == "domain" and target:
+            key = ("domain", target)
+        elif target_type == "content" and target:
+            key = ("content", target)
+        else:
+            key = ("unknown", target or "desconhecido")
+
+        if self.active_contract_violations.get(key) == reason:
+            now = time.time()
+            if self.last_contract_alert_key == key and now - self.last_contract_alert_time < 10:
+                return
+            self.last_contract_alert_key = key
+            self.last_contract_alert_time = now
+        self.active_contract_violations[key] = reason
+        self.show_contract_alert("Você está com pendências contratuais. Use 'contracts fix' ou 'contracts pending'.")
+        self.display.print_warning(message)
+        contracts = data.get('contracts', []) or []
+        if contracts:
+            self.store_contracts(contracts)
+
+    async def process_client_dns_files_sync(self, dns_files):
+        domains = [dns_file['domain'] for dns_file in dns_files]
+        if not domains:
+            return
+        await self.sio.emit('request_client_dns_files', {
+            'domains': domains
+        })
+
+    async def share_missing_dns_files(self, missing_dns):
+        for domain in missing_dns:
+            await self.send_ddns_to_server(domain)
+            await asyncio.sleep(0.1)
+
+    async def process_client_contracts_sync(self, contracts):
+        contract_ids = [contract['contract_id'] for contract in contracts]
+        if not contract_ids:
+            return
+        await self.sio.emit('request_client_contracts', {
+            'contract_ids': contract_ids,
+            'contracts': contracts
+        })
+
+    async def share_missing_contracts(self, missing_contracts):
+        for contract_id in missing_contracts:
+            await self.send_contract_to_server(contract_id)
+            await asyncio.sleep(0.1)
+
 
     def handle_dns_resolve(self, args, connection_state=None):
         if not self.current_user and not connection_state:
@@ -2140,6 +3656,21 @@ VALUES (?, ?, ?, ?, ?, ?)
             'content_type': content_type if content_type != "all" else "",
             'sort_by': sort_by
         })
+
+    async def _search_contracts(self, search_type, search_value, limit=50, offset=0):
+        if not self.connected:
+            return
+        await self.sio.emit('search_contracts', {
+            'search_type': search_type,
+            'search_value': search_value,
+            'limit': limit,
+            'offset': offset
+        })
+
+    async def _get_contract_details(self, contract_id):
+        if not self.connected:
+            return
+        await self.sio.emit('get_contract', {'contract_id': contract_id})
 
     def handle_network(self, args):
         if not self.current_user:
@@ -2420,6 +3951,378 @@ FROM cli_content_cache WHERE content_hash = ?
                 self.display.print_section("Author Public Key")
                 print(public_key)
 
+    def fetch_contract_details(self, contract_id):
+        self.contract_event.clear()
+        self.contract_result = None
+        self.run_async(self._get_contract_details(contract_id))
+        if not self.contract_event.wait(30):
+            self.display.print_error("Contract details timeout")
+            return None
+        if isinstance(self.contract_result, dict) and self.contract_result.get('error'):
+            self.display.print_error(f"Contract error: {self.contract_result['error']}")
+            return None
+        return self.contract_result
+
+    def handle_contracts(self, args):
+        if not self.current_user:
+            self.display.print_error("You need to be logged in to manage contracts")
+            return
+
+        if not args:
+            self.display.print_section("Contracts")
+            self.display.print_info("contracts search --type <all|hash|domain|user|type> --value <value>")
+            self.display.print_info("contracts get <contract_id>")
+            self.display.print_info("contracts analyze <contract_id>")
+            self.display.print_info("contracts pending")
+            self.display.print_info("contracts accept <transfer_id>")
+            self.display.print_info("contracts reject <transfer_id>")
+            self.display.print_info("contracts renounce <transfer_id>")
+            self.display.print_info("contracts fix")
+            self.display.print_info("contracts certify <contract_id>")
+            self.display.print_info("contracts certify-missing <target> [--type domain|content]")
+            self.display.print_info("contracts invalidate <contract_id>")
+            self.display.print_info("contracts sync")
+            return
+
+        subcommand = args[0].lower()
+
+        if subcommand in ('search', 'list'):
+            search_type = 'all'
+            search_value = ''
+            limit = 50
+            i = 1
+            while i < len(args):
+                if args[i] == '--type' and i + 1 < len(args):
+                    search_type = args[i + 1]
+                    i += 2
+                elif args[i] == '--value' and i + 1 < len(args):
+                    search_value = args[i + 1]
+                    i += 2
+                elif args[i] == '--limit' and i + 1 < len(args):
+                    try:
+                        limit = int(args[i + 1])
+                    except ValueError:
+                        self.display.print_error("Invalid limit value")
+                        return
+                    i += 2
+                else:
+                    i += 1
+
+            self.contracts_event.clear()
+            self.contracts_result = None
+            self.run_async(self._search_contracts(search_type, search_value, limit))
+            if not self.contracts_event.wait(30):
+                self.display.print_error("Contracts search timeout")
+                return
+            if isinstance(self.contracts_result, dict) and self.contracts_result.get('error'):
+                self.display.print_error(f"Contracts search error: {self.contracts_result['error']}")
+                return
+            contracts = self.contracts_result or []
+            if not contracts:
+                self.display.print_info("Nenhum contrato encontrado.")
+                return
+            rows = []
+            for contract in contracts:
+                rows.append([
+                    contract.get('contract_id', '')[:12],
+                    contract.get('action_type', ''),
+                    contract.get('domain') or contract.get('content_hash', ''),
+                    contract.get('username', ''),
+                    "OK" if contract.get('integrity_ok', contract.get('verified')) else "FAIL"
+                ])
+            self.display.print_table(["ID", "Ação", "Alvo", "Usuário", "Status"], rows)
+            return
+
+        if subcommand in ('get', 'show'):
+            if len(args) < 2:
+                self.display.print_error("Usage: contracts get <contract_id>")
+                return
+            contract_id = args[1]
+            contract_info = self.fetch_contract_details(contract_id)
+            if not contract_info:
+                return
+            self.show_contract_analyzer(contract_info, title="Contrato")
+            return
+
+        if subcommand == 'analyze':
+            if len(args) < 2:
+                self.display.print_error("Usage: contracts analyze <contract_id>")
+                return
+            contract_id = args[1]
+            contract_info = self.fetch_contract_details(contract_id)
+            if not contract_info:
+                return
+            self.show_contract_analyzer(contract_info)
+            return
+
+        if subcommand == 'pending':
+            self.pending_transfers_event.clear()
+            self.pending_transfers_result = None
+            self.run_async(self.request_pending_transfers())
+            if not self.pending_transfers_event.wait(30):
+                self.display.print_error("Pending transfers timeout")
+                return
+            transfers = self.pending_transfers_result or []
+            violations = list(self.active_contract_violations.items())
+            if not transfers and not violations:
+                self.display.print_info("Nenhuma pendência contratual.")
+                return
+            if violations:
+                rows = []
+                for (target_type, target), reason in violations:
+                    rows.append([target_type, target, reason])
+                self.display.print_table(["Tipo", "Alvo", "Motivo"], rows)
+            if not transfers:
+                return
+            rows = []
+            for transfer in transfers:
+                rows.append([
+                    transfer.get('transfer_id', '')[:8],
+                    transfer.get('transfer_type', ''),
+                    transfer.get('target_user', ''),
+                    transfer.get('original_owner', ''),
+                    transfer.get('contract_id', '')[:12]
+                ])
+            self.display.print_table(["ID", "Tipo", "Destino", "Origem", "Contrato"], rows)
+            return
+
+        if subcommand in ('accept', 'reject', 'renounce'):
+            if len(args) < 2:
+                self.display.print_error(f"Usage: contracts {subcommand} <transfer_id>")
+                return
+            transfer_id = args[1]
+            if not self.pending_transfers:
+                self.pending_transfers_event.clear()
+                self.pending_transfers_result = None
+                self.run_async(self.request_pending_transfers())
+                self.pending_transfers_event.wait(10)
+            pending = next((t for t in self.pending_transfers if t.get('transfer_id') == transfer_id), None)
+            if not pending:
+                self.display.print_error("Transferência não encontrada na lista de pendências")
+                return
+            if subcommand == 'accept':
+                self.start_transfer_accept(pending)
+            elif subcommand == 'reject':
+                self.start_transfer_reject(pending)
+            else:
+                self.start_transfer_renounce(pending)
+            return
+
+        if subcommand == 'fix':
+            if not self.active_contract_violations and not self.pending_transfers:
+                self.display.print_info("Nenhuma pendência contratual.")
+                return
+
+            missing = [
+                (key, reason)
+                for key, reason in self.active_contract_violations.items()
+                if reason == "missing_contract"
+            ]
+            if missing:
+                if self.via_controller or self.no_cli:
+                    for (target_type, target), _reason in missing:
+                        if target_type not in ("domain", "content"):
+                            continue
+                        self.display.print_info(
+                            f"Use: contracts certify-missing {target} --type {target_type}"
+                        )
+                else:
+                    for (target_type, target), _reason in missing:
+                        if target_type not in ("domain", "content"):
+                            continue
+                        confirm = self.display.get_input(
+                            f"Certificar contrato ausente para {target_type} {target}? (y/n): "
+                        ).strip().lower()
+                        if confirm == 'y':
+                            self.start_missing_contract_certify(target_type, target)
+
+            other = [
+                (key, reason)
+                for key, reason in self.active_contract_violations.items()
+                if reason != "missing_contract"
+            ]
+            if other:
+                for (target_type, target), reason in other:
+                    search_type = "domain" if target_type == "domain" else "hash"
+                    if target_type not in ("domain", "content"):
+                        self.display.print_warning(
+                            f"Violação '{reason}' em {target}. "
+                            "Use contracts search para localizar o contrato."
+                        )
+                        continue
+                    self.contracts_event.clear()
+                    self.contracts_result = None
+                    self.run_async(self._search_contracts(search_type, target, limit=10))
+                    if not self.contracts_event.wait(30):
+                        self.display.print_warning("Timeout ao buscar contratos.")
+                        continue
+                    if isinstance(self.contracts_result, dict) and self.contracts_result.get('error'):
+                        self.display.print_warning(f"Erro na busca de contratos: {self.contracts_result['error']}")
+                        continue
+                    contracts = self.contracts_result or []
+                    if not contracts:
+                        self.display.print_warning(
+                            f"Nenhum contrato encontrado para {target_type} {target}. "
+                            "Use 'contracts sync' ou tente novamente."
+                        )
+                        continue
+                    contract_id = contracts[0].get('contract_id')
+                    if not contract_id:
+                        continue
+                    contract_info = self.fetch_contract_details(contract_id)
+                    if contract_info:
+                        self.show_contract_analyzer(contract_info)
+
+            if self.pending_transfers:
+                self.display.print_info("Há transferências pendentes. Use 'contracts pending'.")
+            return
+
+        if subcommand == 'certify':
+            if len(args) < 2:
+                self.display.print_error("Usage: contracts certify <contract_id>")
+                return
+            contract_id = args[1]
+            contract_info = self.fetch_contract_details(contract_id)
+            if not contract_info:
+                return
+            self.start_contract_certify(contract_info)
+            return
+
+        if subcommand == 'certify-missing':
+            if len(args) < 2:
+                self.display.print_error("Usage: contracts certify-missing <target> [--type domain|content]")
+                return
+            target_id = args[1].strip()
+            target_type = None
+            if '--type' in args:
+                idx = args.index('--type')
+                if idx + 1 < len(args):
+                    target_type = args[idx + 1]
+            if not target_type:
+                if '.' in target_id and not re.fullmatch(r'[a-fA-F0-9]{32,64}', target_id):
+                    target_type = 'domain'
+                else:
+                    target_type = 'content'
+            if target_type == 'content' and len(target_id) < 32:
+                self.display.print_error("Hash inválido.")
+                return
+            self.start_missing_contract_certify(target_type, target_id)
+            return
+
+        if subcommand == 'invalidate':
+            if len(args) < 2:
+                self.display.print_error("Usage: contracts invalidate <contract_id>")
+                return
+            contract_id = args[1]
+            contract_info = self.fetch_contract_details(contract_id)
+            if not contract_info:
+                return
+            self.start_contract_invalidate(contract_info)
+            return
+
+        if subcommand == 'sync':
+            self.run_async(self.sync_client_contracts())
+            self.display.print_success("Contract sync completed")
+            return
+
+        self.display.print_error(f"Unknown contracts subcommand: {subcommand}")
+
+    def handle_hps_actions(self, args):
+        if not self.current_user:
+            self.display.print_error("You need to be logged in to use HPS actions")
+            return
+
+        if not args:
+            self.display.print_section("HPS Actions")
+            self.display.print_info("actions transfer-file <content_hash> <target_user>")
+            self.display.print_info("actions transfer-domain <domain> <new_owner>")
+            self.display.print_info("actions transfer-api <app_name> <target_user> <file_path>")
+            self.display.print_info("actions api-app <app_name> <file_path>")
+            return
+
+        subcommand = args[0].lower()
+
+        if subcommand == "transfer-file":
+            if len(args) < 3:
+                self.display.print_error("Usage: actions transfer-file <content_hash> <target_user>")
+                return
+            content_hash = args[1].strip()
+            target_user = args[2].strip()
+            if len(content_hash) < 32 or not target_user:
+                self.display.print_error("Hash ou usuário inválido.")
+                return
+            cached = self.load_cached_content(content_hash)
+            if not cached:
+                self.display.print_error("Conteúdo não encontrado no cache local. Baixe antes de transferir.")
+                return
+            title = self.build_hps_transfer_title("file", target_user)
+            self.upload_content_bytes(
+                title,
+                cached.get('description', ''),
+                cached.get('mime_type', 'application/octet-stream'),
+                cached['content']
+            )
+            return
+
+        if subcommand == "transfer-domain":
+            if len(args) < 3:
+                self.display.print_error("Usage: actions transfer-domain <domain> <new_owner>")
+                return
+            domain = args[1].strip()
+            new_owner = args[2].strip()
+            if not domain or not new_owner:
+                self.display.print_error("Domínio ou novo dono inválido.")
+                return
+            payload = self.build_domain_transfer_payload(domain, new_owner)
+            title = self.build_hps_dns_change_title()
+            self.upload_content_bytes(title, "", "text/plain", payload)
+            return
+
+        if subcommand == "transfer-api":
+            if len(args) < 4:
+                self.display.print_error("Usage: actions transfer-api <app_name> <target_user> <file_path>")
+                return
+            app_name = args[1].strip()
+            target_user = args[2].strip()
+            file_path = args[3]
+            if not app_name or not target_user:
+                self.display.print_error("Nome do app ou usuário inválido.")
+                return
+            if not os.path.exists(file_path):
+                self.display.print_error(f"File not found: {file_path}")
+                return
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if not mime_type:
+                mime_type = 'application/octet-stream'
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            title = self.build_hps_transfer_title("api_app", target_user, app_name)
+            self.upload_content_bytes(title, "", mime_type, content)
+            return
+
+        if subcommand == "api-app":
+            if len(args) < 3:
+                self.display.print_error("Usage: actions api-app <app_name> <file_path>")
+                return
+            app_name = args[1].strip()
+            file_path = args[2]
+            if not app_name:
+                self.display.print_error("Nome do app inválido.")
+                return
+            if not os.path.exists(file_path):
+                self.display.print_error(f"File not found: {file_path}")
+                return
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if not mime_type:
+                mime_type = 'application/octet-stream'
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            title = self.build_hps_api_title(app_name)
+            self.upload_content_bytes(title, "", mime_type, content)
+            return
+
+        self.display.print_error(f"Unknown actions subcommand: {subcommand}")
+
     def handle_servers(self, args):
         if self.via_controller:
             if not self.known_servers:
@@ -2570,6 +4473,10 @@ FROM cli_content_cache WHERE content_hash = ?
 
             self.display.print_info("Syncing local files...")
             self.run_async(self.sync_client_files())
+            self.display.print_info("Syncing DNS cache...")
+            self.run_async(self.sync_client_dns_files())
+            self.display.print_info("Syncing contracts...")
+            self.run_async(self.sync_client_contracts())
 
             self.display.print_info("Getting network state...")
             self.run_async(self._get_network_state())
@@ -2578,6 +4485,8 @@ FROM cli_content_cache WHERE content_hash = ?
         else:
             self.save_known_servers()
             self.run_async(self.sync_client_files())
+            self.run_async(self.sync_client_dns_files())
+            self.run_async(self.sync_client_contracts())
             self.run_async(self._get_network_state())
             print("Sync completed")
 
@@ -2631,6 +4540,9 @@ FROM cli_content_cache WHERE content_hash = ?
             print("  stats - View statistics")
             print("  report <hash> <user> - Report content")
             print("  security <hash> - Verify security")
+            print("  contracts [subcommand] - Manage contracts and transfers")
+            print("  contract [subcommand] - Alias for contracts")
+            print("  actions [subcommand] - HPS actions (transfer/api)")
             print("  servers - Manage servers")
             print("  keys [subcommand] - Manage cryptographic keys")
             print("  sync - Sync with network")
@@ -2653,6 +4565,9 @@ FROM cli_content_cache WHERE content_hash = ?
                 ("stats", "View statistics"),
                 ("report <hash> <user>", "Report content"),
                 ("security <hash>", "Verify security"),
+                ("contracts [subcommand]", "Manage contracts and transfers"),
+                ("contract [subcommand]", "Alias for contracts"),
+                ("actions [subcommand]", "HPS actions (transfer/api)"),
                 ("servers", "Manage servers"),
                 ("keys [subcommand]", "Manage cryptographic keys"),
                 ("sync", "Sync with network"),
@@ -2736,6 +4651,10 @@ class HPSCommandLine(HPSClientCore):
             'stats': self.handle_stats,
             'report': self.handle_report,
             'security': self.handle_security,
+            'contracts': self.handle_contracts,
+            'contract': self.handle_contracts,
+            'actions': self.handle_hps_actions,
+            'hps-actions': self.handle_hps_actions,
             'servers': self.handle_servers,
             'keys': self.handle_keys,
             'sync': self.handle_sync,
