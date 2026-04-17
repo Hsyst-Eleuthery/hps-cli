@@ -1,3 +1,8 @@
+# Este projeto foi descontinuado!
+Com a introdução do HPS v4.0.0, agora este projeto está sendo distribuído no respositório do HPS.
+- Para acessar, [Clique aqui!](https://github.com/Hsyst-Eleuthery/hps)
+
+
 # HPS CLI — HPS Browser em modo totalmente automatizável
 
 Bem-vindo(a) ao **HPS CLI**, a versão **100% linha de comando** do [HPS Browser](https://github.com/Hsyst-Eleuthery/hps) 🌐⚙️
